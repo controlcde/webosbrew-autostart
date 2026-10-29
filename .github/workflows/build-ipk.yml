@@ -5,10 +5,25 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "frontend/**"
+      - "package.json"
+      - "package-lock.json"
+      - "webpack.config.js"
+      - ".github/workflows/build-ipk.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webos-autostart-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build and package IPK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -17,11 +32,19 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: "20"
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: Check package version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building webOS Autostart version $VERSION"
 
       - name: Build application
         run: npm run build
@@ -29,9 +52,36 @@ jobs:
       - name: Package IPK
         run: npm run package
 
+      - name: Verify IPK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.version.outputs.version }}"
+          EXPECTED="org.webosbrew.autostart_${VERSION}_all.ipk"
+
+          echo "Expected package: $EXPECTED"
+
+          if [ ! -f "$EXPECTED" ]; then
+            echo "::error::Expected IPK not found: $EXPECTED"
+            echo "Available IPK files:"
+            find . -maxdepth 2 -name "*.ipk" -print
+            exit 1
+          fi
+
+          if [ ! -s "$EXPECTED" ]; then
+            echo "::error::IPK file is empty"
+            exit 1
+          fi
+
+          echo "Package verified:"
+          ls -lh "$EXPECTED"
+          sha256sum "$EXPECTED"
+
       - name: Upload IPK
         uses: actions/upload-artifact@v4
         with:
-          name: webosbrew-autostart-ipk
-          path: '*.ipk'
+          name: webosbrew-autostart-${{ steps.version.outputs.version }}
+          path: org.webosbrew.autostart_${{ steps.version.outputs.version }}_all.ipk
           if-no-files-found: error
+          retention-days: 30
