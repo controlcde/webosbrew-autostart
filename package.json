@@ -1,7 +1,7 @@
 {
   "name": "org.webosbrew.autostart",
-  "version": "0.1.4",
-  "description": "Autostart test application",
+  "version": "0.1.5",
+  "description": "Reliable Homebrew autostart for rooted webOS 3.x",
   "main": "index.js",
   "scripts": {
     "build": "webpack",
