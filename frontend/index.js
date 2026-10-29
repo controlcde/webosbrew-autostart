@@ -366,8 +366,12 @@ async function main() {
 
   log('Autostart initialization completed successfully.');
 
-  // %AUTOCLOSE% await new Promise(resolve => setTimeout(resolve, 1000));
-  // %AUTOCLOSE% window.close();
+  // Give the user a moment to see the success message.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  // Close the app and return to the previous input.
+  log('Closing autostart application...');
+  window.close();
 }
 
 main().catch((error) => {
