@@ -36,19 +36,18 @@ function log(s) {
 }
 
 function logres(res) {
-  if (res.returnValue) {
+  if (res && res.returnValue === true) {
     if (res.message) {
       log(`... success (${res.message})`);
-    }
-    else {
+    } else {
       log('... success');
     }
-  }
-  else {
-    log(`... failed (${res.message})`);
+  } else {
+    const error = JSON.stringify(res);
+    log(`... failed (${error})`);
+    throw new Error(error);
   }
 }
-
 (async () => {
 
   /* We'll do a certain number of luna calls.
@@ -142,10 +141,49 @@ function logres(res) {
        from the /var/lib/eim contents. */
     await retry(3, async () => {
       log('Setting up eim overlay...');
-      const res = await lunaCall('luna://org.webosbrew.hbchannel.service/exec', {
-        command: 'if [[ ! -d /var/lib/webosbrew/eim ]]; then cp -r /var/lib/eim /var/lib/webosbrew/eim && echo cp ok || echo cp failed; fi ; if ! findmnt /var/lib/eim; then mount --bind /var/lib/webosbrew/eim /var/lib/eim && echo mount overlay ok || echo mount overlay failed; fi',
-      });
-      log(`Result: ${res.stdoutString} ${res.stderrString}`);
+const command = [
+  'set -e',
+
+  // Ensure the persistent Homebrew directory exists.
+  'mkdir -p /var/lib/webosbrew',
+
+  // Create the EIM overlay only once.
+  'if [ ! -d /var/lib/webosbrew/eim ]; then',
+  '  cp -a /var/lib/eim /var/lib/webosbrew/eim',
+  'fi',
+
+  // Ensure that the copied database exists.
+  'test -d /var/lib/webosbrew/eim',
+  'test -f /var/lib/webosbrew/eim/eim_db.dat',
+
+  // Activate the overlay if it is not mounted yet.
+  'if ! findmnt -n /var/lib/eim >/dev/null 2>&1; then',
+  '  mount --bind /var/lib/webosbrew/eim /var/lib/eim',
+  'fi',
+
+  // Verify that the expected overlay is mounted.
+  'findmnt -n /var/lib/eim',
+
+  'echo "EIM_OVERLAY_OK"',
+].join('\n');
+
+const res = await lunaCall(
+  'luna://org.webosbrew.hbchannel.service/exec',
+  { command }
+);
+
+log(`Result: ${res.stdoutString} ${res.stderrString}`);
+
+if (
+  res.returnValue === false ||
+  !res.stdoutString ||
+  !res.stdoutString.includes('EIM_OVERLAY_OK') ||
+  !res.stdoutString.includes('/var/lib/webosbrew/eim')
+) {
+  throw new Error(
+    `EIM overlay setup failed: ${JSON.stringify(res)}`
+  );
+}
     });
   } catch (err) {
     log(`Couldn't setup overlay, stopping here:\n${err.stack}`);
