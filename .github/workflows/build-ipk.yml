@@ -1,50 +1,38 @@
 name: Build webOS Autostart IPK
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
-    paths:
-      - "frontend/**"
-      - "package.json"
-      - "package-lock.json"
-      - "webpack.config.js"
-      - ".github/workflows/build-ipk.yml"
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: webos-autostart-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Build and package IPK
+    name: Build IPK
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: '20'
           cache: npm
 
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-
-      - name: Check package version
-        id: version
-        shell: bash
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building webOS Autostart version $VERSION"
+        run: npm ci
 
       - name: Build application
         run: npm run build
@@ -56,32 +44,68 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
 
-          VERSION="${{ steps.version.outputs.version }}"
-          EXPECTED="org.webosbrew.autostart_${VERSION}_all.ipk"
+          files=(*.ipk)
 
-          echo "Expected package: $EXPECTED"
-
-          if [ ! -f "$EXPECTED" ]; then
-            echo "::error::Expected IPK not found: $EXPECTED"
-            echo "Available IPK files:"
-            find . -maxdepth 2 -name "*.ipk" -print
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one IPK file."
             exit 1
           fi
 
-          if [ ! -s "$EXPECTED" ]; then
-            echo "::error::IPK file is empty"
-            exit 1
-          fi
+          echo "Created package: ${files[0]}"
+          ls -lh "${files[0]}"
 
-          echo "Package verified:"
-          ls -lh "$EXPECTED"
-          sha256sum "$EXPECTED"
-
-      - name: Upload IPK
+      - name: Upload IPK artifact
         uses: actions/upload-artifact@v5
         with:
-          name: webosbrew-autostart-${{ steps.version.outputs.version }}
-          path: org.webosbrew.autostart_${{ steps.version.outputs.version }}_all.ipk
+          name: webos-autostart-ipk
+          path: '*.ipk'
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download IPK artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: webos-autostart-ipk
+          path: release
+
+      - name: Verify release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=(release/*.ipk)
+
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one release IPK."
+            exit 1
+          fi
+
+          echo "Release package: ${files[0]}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG_NAME" release/*.ipk \
+            --title "webOS Homebrew Autostart $TAG_NAME" \
+            --generate-notes \
+            --verify-tag
