@@ -1,211 +1,375 @@
 import 'core-js/stable';
 import 'regenerator-runtime';
 
-import "webostvjs/webOSTV";
+import 'webostvjs/webOSTV';
 
-function lunaCall(uri, parameters) {
+const APP_ID = 'org.webosbrew.autostart';
+
+const EIM_SOURCE = '/var/lib/eim';
+const EIM_OVERLAY = '/var/lib/webosbrew/eim';
+
+const MAX_RETRIES = 3;
+
+function log(message) {
+  const output = document.querySelector('pre');
+  const line = `[${new Date().toISOString()}] ${message}\n`;
+
+  if (output) {
+    output.textContent += line;
+  }
+
+  console.log(message);
+}
+
+function lunaCall(uri, parameters = {}) {
   return new Promise((resolve, reject) => {
-    const s = uri.indexOf("/", 7);
-    webOS.service.request(uri.substr(0, s), {
-      method: uri.substr(s + 1),
+    const separator = uri.indexOf('/', 7);
+
+    if (separator === -1) {
+      reject(new Error(`Invalid Luna URI: ${uri}`));
+      return;
+    }
+
+    webOS.service.request(uri.substring(0, separator), {
+      method: uri.substring(separator + 1),
       parameters,
-      onSuccess: resolve,
-      onFailure: (res) => {
-        reject(new Error(JSON.stringify(res)));
+
+      onSuccess: (response) => {
+        if (response && response.returnValue === false) {
+          reject(new Error(JSON.stringify(response)));
+          return;
+        }
+
+        resolve(response);
+      },
+
+      onFailure: (response) => {
+        reject(new Error(JSON.stringify(response)));
       },
     });
   });
 }
 
-async function retry(attempt, cb) {
-  while (true) {
+async function retry(attempts, callback) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await cb();
-    } catch (err) {
-      if (attempt--) {
-        log (`... failed (${err.message}), ${attempt} tries left`);
-        continue;
+      return await callback();
+    } catch (error) {
+      lastError = error;
+
+      const remaining = attempts - attempt;
+
+      log(
+        `Attempt ${attempt}/${attempts} failed: ` +
+        `${error.message || error}. ${remaining} tries left.`
+      );
+
+      if (remaining > 0) {
+        // Give Luna services a moment to recover during startup.
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-      throw err;
     }
   }
+
+  throw lastError;
 }
 
-function log(s) {
-  document.querySelector('pre').innerText += `[${new Date()}] ${s}\n`;
-}
+function logres(response) {
+  if (!response || response.returnValue !== true) {
+    throw new Error(
+      `Luna call failed: ${JSON.stringify(response)}`
+    );
+  }
 
-function logres(res) {
-  if (res && res.returnValue === true) {
-    if (res.message) {
-      log(`... success (${res.message})`);
-    } else {
-      log('... success');
-    }
+  if (response.message) {
+    log(`... success (${response.message})`);
   } else {
-    const error = JSON.stringify(res);
-    log(`... failed (${error})`);
-    throw new Error(error);
+    log('... success');
   }
 }
-(async () => {
 
-  /* We'll do a certain number of luna calls.
-     On startup, sometimes these calls fail (bus overload?),
-     so we'll retry them 3 times if we get an error.
-     Each call usually take between 0 and 10 seconds. */
-
-  try {
-  /* Be polite and launch the actual previous input app, if any.
-     This'll give back control to the user while we finish our setup
-     in the background, as the whole process can be slow due to luna calls
-     and the number of other processes competing for CPU on startup. */
-    await retry(3, async () => {
-      log("Checking last input app...");
-      const lastinput = await lunaCall('luna://org.webosbrew.hbchannel.service/exec', {
-        command: 'cat /var/lib/eim/lastinput',
-      });
-      if (lastinput.stdoutString) {
-        const lastinputPayload = JSON.parse(lastinput.stdoutString);
-        if (lastinputPayload.appId) {
-          log(`Last input app: ${lastinputPayload.appId}`);
-          if (lastinputPayload.appId !== 'org.webosbrew.autostart') {
-            log("Relaunching this app...");
-            const res = await lunaCall('luna://com.webos.service.applicationManager/launch', {
-              id: lastinputPayload.appId,
-            });
-            logres(res);
-          }
-        }
-      }
-      else {
-        log("No app to relaunch.");
-      }
-    });
-  } catch (err) {
-    log(`Couldn't start last input app but carrying on:\n${err.stack}`);
-  }
-
-  try {
-  /* Launch autostart soon in the process because even if we fail later down,
-     at least everything will have started (including SSH). */
-    await retry(3, async () => {
-      log("Launching autostart...");
-      const res = await lunaCall('luna://org.webosbrew.hbchannel.service/autostart', {});
-      logres(res);
-    });
-  } catch (err) {
-    log(`Couldn't run autostart, but carrying on:\n${err.stack}`);
-  }
-
-  /* Now, all that we want is ensuring that we get started on next boot,
-     all the logic below is here to ensure this is the case. */
-
-  try {
-    /* First, unregister (always succeeds, even if we weren't registered),
-       this is needed because we'll get started only on the boot following
-       a successful addDevice, and this only succeeds if we're not already in the list. */
-    await retry(3, async () => {
-      log('Unregistering ourselves as input app...');
-      const res = await lunaCall('luna://com.webos.service.eim/deleteDevice', {
-        appId: 'org.webosbrew.autostart',
-      });
-      logres(res);
-    });
-  } catch (err) {
-    log(`Couldn't unregister, but carrying on:\n${err.stack}`);
-  }
-
-  try {
-    // Register again to ensure we're started on next boot.
-    await retry(3, async () => {
-      log('Registering ourselves as input app...');
-      const res = await lunaCall('luna://com.webos.service.eim/addDevice', {
-        appId: 'org.webosbrew.autostart',
-        pigImage: '',
-        mvpdIcon: '',
-        type: 'MVPD_IP', // can be either MVPD_IP or MVPD_RF, required for webOS 3.4 at least
-        label: 'Autostart', // required for webOS 3.4 at least
-        description: 'webosbrew autostart', // required for webOS 3.4 at least
-      });
-      logres(res);
-    });
-  } catch (err) {
-    log(`Couldn't register, but carrying on:\n${err.stack}`);
-  }
-
-  try {
-    /* Now, setup an eim overlay so that any changes done later don't erase our own app
-       if /var/lib/webosbrew/eim already exists, keep it that way, changes done in previous
-       sessions will live here, so just bind mount it, otherwise create it
-       from the /var/lib/eim contents. */
-    await retry(3, async () => {
-      log('Setting up eim overlay...');
-const command = [
-  'set -e',
-
-  // Ensure the persistent Homebrew directory exists.
-  'mkdir -p /var/lib/webosbrew',
-
-  // Create the EIM overlay only once.
-  'if [ ! -d /var/lib/webosbrew/eim ]; then',
-  '  cp -a /var/lib/eim /var/lib/webosbrew/eim',
-  'fi',
-
-  // Ensure that the copied database exists.
-  'test -d /var/lib/webosbrew/eim',
-  'test -f /var/lib/webosbrew/eim/eim_db.dat',
-
-  // Activate the overlay if it is not mounted yet.
-  'if ! findmnt -n /var/lib/eim >/dev/null 2>&1; then',
-  '  mount --bind /var/lib/webosbrew/eim /var/lib/eim',
-  'fi',
-
-  // Verify that the expected overlay is mounted.
-  'findmnt -n /var/lib/eim',
-
-  'echo "EIM_OVERLAY_OK"',
-].join('\n');
-
-const res = await lunaCall(
-  'luna://org.webosbrew.hbchannel.service/exec',
-  { command }
-);
-
-log(`Result: ${res.stdoutString} ${res.stderrString}`);
-
-if (
-  res.returnValue === false ||
-  !res.stdoutString ||
-  !res.stdoutString.includes('EIM_OVERLAY_OK') ||
-  !res.stdoutString.includes('/var/lib/webosbrew/eim')
-) {
-  throw new Error(
-    `EIM overlay setup failed: ${JSON.stringify(res)}`
+async function exec(command) {
+  const response = await lunaCall(
+    'luna://org.webosbrew.hbchannel.service/exec',
+    { command }
   );
+
+  const stdout = response.stdoutString || '';
+  const stderr = response.stderrString || '';
+
+  if (stdout) {
+    log(`stdout:\n${stdout.trim()}`);
+  }
+
+  if (stderr) {
+    log(`stderr:\n${stderr.trim()}`);
+  }
+
+  return response;
 }
-    });
-  } catch (err) {
-    log(`Couldn't setup overlay, stopping here:\n${err.stack}`);
+
+async function restoreLastInput() {
+  await retry(MAX_RETRIES, async () => {
+    log('Checking last input app...');
+
+    const response = await exec(
+      `cat ${EIM_SOURCE}/lastinput`
+    );
+
+    if (!response.stdoutString) {
+      log('No previous input found.');
+      return;
+    }
+
+    const lastInput = JSON.parse(response.stdoutString);
+
+    if (!lastInput.appId) {
+      log('Previous input has no appId.');
+      return;
+    }
+
+    log(`Last input app: ${lastInput.appId}`);
+
+    if (lastInput.appId === APP_ID) {
+      log('Skipping relaunch of autostart itself.');
+      return;
+    }
+
+    log('Relaunching previous input...');
+
+    const launchResponse = await lunaCall(
+      'luna://com.webos.service.applicationManager/launch',
+      { id: lastInput.appId }
+    );
+
+    logres(launchResponse);
+  });
+}
+
+async function startHomebrew() {
+  await retry(MAX_RETRIES, async () => {
+    log('Launching Homebrew startup...');
+
+    const response = await lunaCall(
+      'luna://org.webosbrew.hbchannel.service/autostart',
+      {}
+    );
+
+    logres(response);
+  });
+}
+
+async function deleteInputRegistration() {
+  const response = await lunaCall(
+    'luna://com.webos.service.eim/deleteDevice',
+    { appId: APP_ID }
+  );
+
+  logres(response);
+}
+
+async function addInputRegistration() {
+  const response = await lunaCall(
+    'luna://com.webos.service.eim/addDevice',
+    {
+      appId: APP_ID,
+      pigImage: '',
+      mvpdIcon: '',
+      type: 'MVPD_IP',
+      label: 'Autostart',
+      description: 'webosbrew autostart',
+    }
+  );
+
+  logres(response);
+}
+
+function buildOverlayCommand() {
+  return [
+    'set -eu',
+
+    `SOURCE="${EIM_SOURCE}"`,
+    `OVERLAY="${EIM_OVERLAY}"`,
+
+    // Create persistent Homebrew storage if necessary.
+    'mkdir -p /var/lib/webosbrew',
+
+    // Never overwrite an existing overlay.
+    'if [ ! -d "$OVERLAY" ]; then',
+    '  echo "Creating persistent EIM overlay..."',
+    '  cp -a "$SOURCE" "$OVERLAY"',
+    'fi',
+
+    // Validate the copied database before mounting.
+    'test -d "$OVERLAY"',
+    'test -f "$OVERLAY/eim_db.dat"',
+
+    // A mount may already exist after another app invocation.
+    'if findmnt -n "$SOURCE" >/dev/null 2>&1; then',
+    '  echo "EIM is already mounted."',
+    'else',
+    '  echo "Mounting persistent EIM overlay..."',
+    '  mount --bind "$OVERLAY" "$SOURCE"',
+    'fi',
+
+    // Verify that the mount really points to our overlay.
+    'MOUNT_SOURCE="$(findmnt -n -o SOURCE "$SOURCE")"',
+
+    'case "$MOUNT_SOURCE" in',
+    '  *"[/var/lib/webosbrew/eim]")',
+    '    echo "EIM mount source verified."',
+    '    ;;',
+    '  *)',
+    '    echo "ERROR: Unexpected EIM mount source: $MOUNT_SOURCE" >&2',
+    '    exit 1',
+    '    ;;',
+    'esac',
+
+    // Verify that the database remains accessible.
+    'test -f "$SOURCE/eim_db.dat"',
+
+    // Emit the success marker only after all checks pass.
+    'echo "EIM_OVERLAY_OK"',
+  ].join('\n');
+}
+
+async function setupEimOverlay() {
+  await retry(MAX_RETRIES, async () => {
+    log('Setting up EIM overlay...');
+
+    const response = await exec(buildOverlayCommand());
+
+    const stdout = response.stdoutString || '';
+
+    if (!stdout.includes('EIM_OVERLAY_OK')) {
+      throw new Error(
+        `EIM overlay setup failed: ${JSON.stringify(response)}`
+      );
+    }
+
+    log('EIM overlay successfully verified.');
+  });
+}
+
+async function main() {
+  log('webOS Homebrew Autostart 0.1.5');
+  log('Starting initialization...');
+
+  /*
+   * Restore the previous input early so the user can continue
+   * watching TV while the remaining operations run.
+   */
+  try {
+    await restoreLastInput();
+  } catch (error) {
+    log(
+      `Could not restore previous input; continuing:\n${error.stack}`
+    );
+  }
+
+  /*
+   * Start Homebrew as early as possible.
+   *
+   * This starts SSH and the configured Homebrew services,
+   * including Glasshouse.
+   */
+  try {
+    await startHomebrew();
+  } catch (error) {
+    log(
+      `Could not start Homebrew; continuing:\n${error.stack}`
+    );
+  }
+
+  /*
+   * Prepare the next boot.
+   *
+   * The EIM mechanism requires:
+   *
+   * 1. Remove the current registration.
+   * 2. Register the app again in the real EIM database.
+   * 3. Bind-mount the persistent overlay.
+   * 4. Remove the registration from the mounted overlay.
+   *
+   * The real database retains the registration so webOS
+   * launches this application again on the next boot.
+   */
+
+  try {
+    log('Unregistering previous input-app entry...');
+
+    await retry(MAX_RETRIES, deleteInputRegistration);
+  } catch (error) {
+    log(
+      `Could not remove previous registration; continuing:\n` +
+      `${error.stack}`
+    );
+  }
+
+  /*
+   * Register the app for the next boot.
+   *
+   * Unlike the original implementation, failure here is fatal
+   * for the EIM setup. We must not delete a registration from
+   * the overlay if registration in the real database failed.
+   */
+  try {
+    log('Registering autostart as input app...');
+
+    await retry(MAX_RETRIES, addInputRegistration);
+  } catch (error) {
+    log(
+      `ERROR: Could not register autostart.\n${error.stack}`
+    );
+
+    log('Stopping EIM setup to preserve the current state.');
     return;
   }
 
+  /*
+   * Create or activate the persistent EIM overlay.
+   *
+   * Never proceed to the final deleteDevice unless the
+   * expected bind mount has been verified.
+   */
   try {
-    /* This just removes ourselves from the overlay, but we still live in the real /var/lib/eim,
-       which guarantees that we'll survive on the next reboot. */
-    await retry(3, async () => {
-      log('Unregistering ourselves as input app from the overlay...');
-      const res = await lunaCall('luna://com.webos.service.eim/deleteDevice', {
-        appId: 'org.webosbrew.autostart',
-      });
-      logres(res);
-    });
-  } catch (err) {
-    log(`Couldn't unregister, but carrying on:\n${err.stack}`);
+    await setupEimOverlay();
+  } catch (error) {
+    log(
+      `ERROR: Could not initialize EIM overlay.\n${error.stack}`
+    );
+
+    log('Stopping before deleting the input-app registration.');
+    return;
   }
 
-  log("Done.");
+  /*
+   * Remove our registration from the mounted overlay.
+   *
+   * The underlying EIM database still contains the entry,
+   * which allows webOS to launch us on the next boot.
+   */
+  try {
+    log('Removing autostart registration from EIM overlay...');
+
+    await retry(MAX_RETRIES, deleteInputRegistration);
+  } catch (error) {
+    log(
+      `ERROR: Could not remove registration from overlay.\n` +
+      `${error.stack}`
+    );
+
+    return;
+  }
+
+  log('Autostart initialization completed successfully.');
 
   // %AUTOCLOSE% await new Promise(resolve => setTimeout(resolve, 1000));
   // %AUTOCLOSE% window.close();
-})();
+}
+
+main().catch((error) => {
+  log(`Unexpected fatal error:\n${error.stack || error}`);
+});
